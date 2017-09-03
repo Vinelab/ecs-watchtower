@@ -1,0 +1,6 @@
+*:2015
+root /var/cache/ecs-watchtower
+basicauth vinelab status@vinelab123 {
+    /
+}
+gzip
