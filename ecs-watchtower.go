@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -243,8 +244,12 @@ func checkError(err error) {
 	}
 }
 
-func (c *Cluster) SetServices(s []*Service) {
-	c.Services = s
+func (c *Cluster) SetServices(s chan *Service, count int) {
+	var services []*Service
+	for i := 0; i < count; i++ {
+		services = append(services, <-s)
+	}
+	c.Services = services
 }
 
 func listClusters(svc *ecs.ECS) []*Cluster {
@@ -291,7 +296,6 @@ func listServices(svc *ecs.ECS, cluster *Cluster) []*ecs.Service {
 	checkError(err)
 
 	arns := result.ServiceArns
-	// fmt.Println("Services arns:")
 
 	servicesInput := &ecs.DescribeServicesInput{
 		Cluster:  cluster.Arn,
@@ -311,12 +315,10 @@ func getTaskDefinitionForService(svc *ecs.ECS, s *ecs.Service, c *Cluster) *ecs.
 
 	result, err := svc.DescribeTaskDefinition(input)
 	checkError(err)
-
 	return result.TaskDefinition
 }
 
 func listServiceTasks(svc *ecs.ECS, service *ecs.Service, cluster *Cluster) []*Task {
-	// fmt.Println("listing tasks for ", *cluster.Arn, *service.ServiceArn)
 	arnsInput := &ecs.ListTasksInput{
 		Cluster:     cluster.Arn,
 		ServiceName: service.ServiceArn,
@@ -325,20 +327,23 @@ func listServiceTasks(svc *ecs.ECS, service *ecs.Service, cluster *Cluster) []*T
 	arnsResult, err := svc.ListTasks(arnsInput)
 	checkError(err)
 
-	tasksInput := &ecs.DescribeTasksInput{
-		Cluster: cluster.Arn,
-		Tasks:   arnsResult.TaskArns,
+	if len(arnsResult.TaskArns) > 0 {
+		tasksInput := &ecs.DescribeTasksInput{
+			Cluster: cluster.Arn,
+			Tasks:   arnsResult.TaskArns,
+		}
+
+		result, err := svc.DescribeTasks(tasksInput)
+		checkError(err)
+
+		var tasks []*Task
+		for _, ecsTask := range result.Tasks {
+			tasks = append(tasks, &Task{ecsTask})
+		}
+		return tasks
 	}
 
-	result, err := svc.DescribeTasks(tasksInput)
-	checkError(err)
-
-	var tasks []*Task
-	for _, ecsTask := range result.Tasks {
-		task := &Task{ecsTask}
-		tasks = append(tasks, task)
-	}
-	return tasks
+	return []*Task{}
 }
 
 func getContainerInstance(svc *ecs.ECS, c *Cluster, i *string) *ecs.ContainerInstance {
@@ -374,6 +379,41 @@ func getEc2Instance(svc *ec2.EC2, id *string) *ec2.Instance {
 	return nil
 }
 
+func makeService(svc *ecs.ECS, ecsService *ecs.Service, cluster *Cluster, services chan *Service, wg *sync.WaitGroup) {
+	defer wg.Done()
+	// list service tasks
+	tasks := listServiceTasks(svc, ecsService, cluster)
+	taskDefinition := getTaskDefinitionForService(svc, ecsService, cluster)
+	services <- &Service{
+		Arn:               ecsService.ServiceArn,
+		Name:              ecsService.ServiceName,
+		Status:            ecsService.Status,
+		ClusterArn:        ecsService.ClusterArn,
+		CreatedAt:         ecsService.CreatedAt,
+		DesiredCount:      ecsService.DesiredCount,
+		PendingCount:      ecsService.PendingCount,
+		RoleArn:           ecsService.RoleArn,
+		RunningCount:      ecsService.RunningCount,
+		TaskDefinitionArn: ecsService.TaskDefinition,
+		TaskDefinition:    taskDefinition,
+		Tasks:             tasks,
+	}
+}
+
+func getClusterInfo(svc *ecs.ECS, cluster *Cluster, wg *sync.WaitGroup) {
+	defer wg.Done()
+	ecsServices := listServices(svc, cluster)
+
+	services := make(chan *Service, len(ecsServices))
+	var servicesWG sync.WaitGroup
+	servicesWG.Add(len(ecsServices))
+	for _, ecsService := range ecsServices {
+		go makeService(svc, ecsService, cluster, services, &servicesWG)
+	}
+	servicesWG.Wait()
+	cluster.SetServices(services, len(ecsServices))
+}
+
 func FetchAndCheck() {
 	const REGION = "eu-central-1"
 
@@ -387,40 +427,17 @@ func FetchAndCheck() {
 	fmt.Println(len(clusters), " clusters found")
 
 	// list cluster services and associate them accordingly
+	var wg sync.WaitGroup
+	wg.Add(len(clusters))
 	for _, cluster := range clusters {
-		ecsServices := listServices(svc, cluster)
-
-		var services []*Service
-		for _, ecsService := range ecsServices {
-			// list service tasks
-			tasks := listServiceTasks(svc, ecsService, cluster)
-			taskDefinition := getTaskDefinitionForService(svc, ecsService, cluster)
-			service := &Service{
-				Arn:               ecsService.ServiceArn,
-				Name:              ecsService.ServiceName,
-				Status:            ecsService.Status,
-				ClusterArn:        ecsService.ClusterArn,
-				CreatedAt:         ecsService.CreatedAt,
-				DesiredCount:      ecsService.DesiredCount,
-				PendingCount:      ecsService.PendingCount,
-				RoleArn:           ecsService.RoleArn,
-				RunningCount:      ecsService.RunningCount,
-				TaskDefinitionArn: ecsService.TaskDefinition,
-				TaskDefinition:    taskDefinition,
-				Tasks:             tasks,
-			}
-
-			services = append(services, service)
-		}
-		cluster.SetServices(services)
+		go getClusterInfo(svc, cluster, &wg)
 	}
+	wg.Wait()
 
 	var checks []*HealthCheckConfig
 	for _, cluster := range clusters {
-		// fmt.Println(*cluster.Name + ": ")
 		for _, service := range cluster.Services {
 			// get info about the service and its tasks
-			// fmt.Println(*service.Name)
 			var sn *string
 			var hcinfo []string
 			// determines whether this services need to be checked or not.
@@ -466,7 +483,6 @@ func FetchAndCheck() {
 					} else {
 						hcconf.SetCheckEndpoint(hcinfo[2])
 					}
-					// fmt.Println("Task has ", len(task.Containers), " containers")
 					// describe container instance
 					ci := getContainerInstance(svc, cluster, task.ContainerInstanceArn)
 					if ci != nil {
