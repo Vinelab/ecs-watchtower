@@ -12,6 +12,12 @@ import (
 type PrintNotifier struct {
 }
 
+// RecoverySlackNotifier handles failing checks and attempts to recover them
+// and when a failure is detected it notifies us on Slack about it
+type RecoverySlackNotifier struct {
+	Infrastructure *infrastructure.Infrastructure
+}
+
 // IPAccess determines whether to access the private or public IP address of a service
 type IPAccess string
 
@@ -92,14 +98,47 @@ func (hcc *HealthCheckConfig) SetCheckEndpoint(e string) {
 	hcc.CheckEndpoint = e
 }
 
+func (hcc *HealthCheckConfig) GetPublicCheckAddress() string {
+	return fmt.Sprintf("%s://%s:%d", "http", hcc.CheckPublicIPAddress, hcc.CheckPort)
+}
+
+func (hcc *HealthCheckConfig) GetPrivateCheckAddress() string {
+	return fmt.Sprintf("%s://%s:%d", "http", hcc.CheckPrivateIPAddress, hcc.CheckPort)
+}
+
 func (pn PrintNotifier) Notify(result []checkup.Result) error {
 	fmt.Println(result)
 
 	return nil
 }
 
-func checkAndStore(checkers []checkup.Checker) {
+func (rsn RecoverySlackNotifier) Notify(result []checkup.Result) error {
+	// get the failing check
+	var check checkup.Result
+	for _, chk := range result {
+		if chk.Down {
+			check = chk
+		}
+	}
+
+	if check.Down {
+		// determine the task using the check's endpoint
+		t, exists := TasksByEndpoint[check.Endpoint]
+		if exists {
+			// stop task
+			err := rsn.Infrastructure.Recover(t, check.Notice)
+			// notify slack
+			fmt.Println(check.Title, "is down, stopped", strings.Split(*t.TaskArn, "/")[1])
+			return err
+		}
+	}
+
+	return nil
+}
+
+func checkAndStore(i *infrastructure.Infrastructure, checkers []checkup.Checker) {
 	n := PrintNotifier{}
+	// n := RecoverySlackNotifier{i}
 
 	c := checkup.Checkup{
 		Checkers: checkers,
@@ -112,8 +151,25 @@ func checkAndStore(checkers []checkup.Checker) {
 	c.CheckAndStore()
 }
 
+// TasksByEndpoint is a map of endpoints as keys and pointers to tasks,
+// used to reverse-reference tasks from endpoints i.e. when a check fails
+// we only have a reference to the endpoint so we'll need the task to be able
+// to act upon the failure.
+var TasksByEndpoint map[string]*infrastructure.Task
+
+func clearTasksByEndpoint() {
+	for i := range TasksByEndpoint {
+		delete(TasksByEndpoint, i)
+	}
+}
+
 // Check performs the health check on the corresponding services in the given clusters
 func Check(i *infrastructure.Infrastructure, clusters []*infrastructure.Cluster) {
+	// clear the map of tasks by endpoints so that we start fresh
+	clearTasksByEndpoint()
+	TasksByEndpoint = make(map[string]*infrastructure.Task)
+
+	// collect the checks so that we create checkup checkers from them
 	var checks []*HealthCheckConfig
 	for _, cluster := range clusters {
 		for _, service := range cluster.Services {
@@ -186,6 +242,9 @@ func Check(i *infrastructure.Infrastructure, clusters []*infrastructure.Cluster)
 							}
 						}
 					}
+					// fill the tasks for both public and private
+					TasksByEndpoint[hcconf.GetPublicCheckAddress()] = task
+					TasksByEndpoint[hcconf.GetPrivateCheckAddress()] = task
 
 					checks = append(checks, &hcconf)
 				}
@@ -213,5 +272,5 @@ func Check(i *infrastructure.Infrastructure, clusters []*infrastructure.Cluster)
 		}
 	}
 
-	checkAndStore(checkers)
+	checkAndStore(i, checkers)
 }

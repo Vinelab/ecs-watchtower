@@ -169,24 +169,36 @@ func (i *Infrastructure) listClusters() []*Cluster {
 }
 
 func (i *Infrastructure) listServices(cluster *Cluster) []*ecs.Service {
-	input := &ecs.ListServicesInput{
-		Cluster: cluster.Arn,
+	var services []*ecs.Service
+	var nextToken *string
+
+	for {
+		input := &ecs.ListServicesInput{
+			Cluster:   cluster.Arn,
+			NextToken: nextToken,
+		}
+
+		result, err := i.ECSSvc.ListServices(input)
+		i.checkError(err)
+
+		arns := result.ServiceArns
+
+		servicesInput := &ecs.DescribeServicesInput{
+			Cluster:  cluster.Arn,
+			Services: arns,
+		}
+
+		servicesResult, err := i.ECSSvc.DescribeServices(servicesInput)
+		i.checkError(err)
+
+		services = append(services, servicesResult.Services...)
+
+		if result.NextToken == nil {
+			return services
+		}
+
+		nextToken = result.NextToken
 	}
-
-	result, err := i.ECSSvc.ListServices(input)
-	i.checkError(err)
-
-	arns := result.ServiceArns
-
-	servicesInput := &ecs.DescribeServicesInput{
-		Cluster:  cluster.Arn,
-		Services: arns,
-	}
-
-	servicesResult, err := i.ECSSvc.DescribeServices(servicesInput)
-	i.checkError(err)
-
-	return servicesResult.Services
 }
 
 func (i *Infrastructure) getTaskDefinitionForService(s *ecs.Service, c *Cluster) *ecs.TaskDefinition {
@@ -337,4 +349,17 @@ func (i *Infrastructure) Clusters() []*Cluster {
 	wg.Wait()
 
 	return clusters
+}
+
+// Recover a failing task
+func (i Infrastructure) Recover(t *Task, reason string) error {
+	input := &ecs.StopTaskInput{
+		Cluster: t.ClusterArn,
+		Task:    t.TaskArn,
+		Reason:  aws.String(reason),
+	}
+
+	_, err := i.ECSSvc.StopTask(input)
+
+	return err
 }

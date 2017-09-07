@@ -28,5 +28,4 @@ func main() {
 	}()
 
 	select {}
-	// Watch(checkers)
 }
